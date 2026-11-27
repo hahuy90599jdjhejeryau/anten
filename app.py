@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import io
 import math
+from pathlib import Path
 from typing import Any
+
+import joblib
 
 import numpy as np
 import pandas as pd
@@ -18,6 +21,162 @@ from antenna_core import (
     make_sweep_data,
 )
 from ai_engine import generate_synthetic_dataset, predict_one, train_models
+
+# -----------------------------------------------------------------------------
+# AI model artifact configuration
+# -----------------------------------------------------------------------------
+APP_DIR = Path(__file__).resolve().parent
+MODEL_DIR = APP_DIR / "models"
+MODEL_PATHS = {
+    "Random Forest": MODEL_DIR / "looplab_random_forest.joblib",
+    "ANN": MODEL_DIR / "looplab_ann.joblib",
+}
+AI_INPUT_DOMAIN = {
+    "radius_cm": (0.8, 8.0),
+    "freq_mhz": (5.0, 50.0),
+    "wire_radius_mm": (0.25, 1.5),
+    "n_turns": (1, 4),
+}
+AI_FEATURES = ["radius_cm", "freq_mhz", "wire_radius_mm", "n_turns", "rho_ohm_m"]
+AI_TARGETS = ["Rr_ohm", "Zin_real_ohm", "Zin_imag_ohm", "gain_dBi_approx"]
+SESSION_BUNDLE_KEYS = {
+    "Random Forest": "looplab_rf_bundle_v2",
+    "ANN": "looplab_ann_bundle_v2",
+}
+
+
+def validate_model_bundle(bundle: Any, expected_name: str) -> dict[str, Any]:
+    """Reject incompatible or incomplete model artifacts before prediction."""
+    if not isinstance(bundle, dict):
+        raise ValueError("Tệp mô hình không đúng định dạng bundle của LoopLab.")
+    if bundle.get("model_name") != expected_name:
+        raise ValueError(
+            f"Tệp này được lưu cho {bundle.get('model_name')!r}, không phải {expected_name!r}."
+        )
+    if list(bundle.get("feature_columns", [])) != AI_FEATURES:
+        raise ValueError("Danh sách đầu vào trong mô hình không tương thích với phiên bản LoopLab này.")
+    models = bundle.get("models")
+    if not isinstance(models, dict) or any(target not in models for target in AI_TARGETS):
+        raise ValueError("Bundle không chứa đủ 4 mô hình đầu ra cần thiết.")
+    if not isinstance(bundle.get("metrics"), pd.DataFrame):
+        raise ValueError("Bundle không chứa bảng metrics hợp lệ.")
+    return bundle
+
+
+def serialize_bundle(bundle: dict[str, Any]) -> bytes:
+    """Serialize a trained bundle for download or repository storage."""
+    buffer = io.BytesIO()
+    joblib.dump(bundle, buffer, compress=3)
+    return buffer.getvalue()
+
+
+def load_bundle_bytes(raw: bytes, expected_name: str) -> dict[str, Any]:
+    """Load only a user-owned LoopLab artifact; joblib files are pickle-based."""
+    bundle = joblib.load(io.BytesIO(raw))
+    return validate_model_bundle(bundle, expected_name)
+
+
+def load_saved_bundles_once() -> list[str]:
+    """Load committed/local model files into this Streamlit session once."""
+    messages: list[str] = []
+    for model_name, path in MODEL_PATHS.items():
+        state_key = SESSION_BUNDLE_KEYS[model_name]
+        if state_key in st.session_state or not path.is_file():
+            continue
+        try:
+            bundle = joblib.load(path)
+            st.session_state[state_key] = validate_model_bundle(bundle, model_name)
+            messages.append(f"Đã nạp {model_name} từ {path.relative_to(APP_DIR)}.")
+        except Exception as exc:
+            messages.append(f"Không nạp được {path.name}: {exc}")
+    return messages
+
+
+def save_bundle_locally(bundle: dict[str, Any], model_name: str) -> str | None:
+    """Save a model beside the app; on Streamlit Cloud this filesystem may be ephemeral."""
+    path = MODEL_PATHS[model_name]
+    try:
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        joblib.dump(bundle, path, compress=3)
+        return str(path.relative_to(APP_DIR))
+    except OSError:
+        return None
+
+
+def ai_domain_violations(radius: float, freq: float, wire: float, turns: int, material_name: str) -> list[str]:
+    """Return explicit reasons why an input is outside the synthetic training domain."""
+    checks = [
+        ("radius_cm", radius, "Bán kính R"),
+        ("freq_mhz", freq, "Tần số f"),
+        ("wire_radius_mm", wire, "Bán kính dây a"),
+    ]
+    problems: list[str] = []
+    for key, value, label in checks:
+        low, high = AI_INPUT_DOMAIN[key]
+        if not (low <= float(value) <= high):
+            problems.append(f"{label} phải nằm trong [{low:g}, {high:g}].")
+    low_n, high_n = AI_INPUT_DOMAIN["n_turns"]
+    if int(turns) != turns or not (low_n <= int(turns) <= high_n):
+        problems.append(f"Số vòng N phải là số nguyên trong [{low_n}, {high_n}].")
+    if material_name not in MATERIALS:
+        problems.append("Vật liệu chưa có trong bộ dữ liệu huấn luyện.")
+    # Keep the physical small-loop criterion explicit, even though the current
+    # generated range is designed to remain below 0.1 at its upper corner.
+    circumference_lambda = 2.0 * math.pi * (float(radius) / 100.0) * (float(freq) * 1e6) / 299_792_458.0
+    if circumference_lambda >= 0.1:
+        problems.append(f"C/λ = {circumference_lambda:.5g} không thỏa điều kiện vòng nhỏ C/λ < 0.1.")
+    return problems
+
+
+def build_model_comparison(rf_bundle: dict[str, Any], ann_bundle: dict[str, Any]) -> pd.DataFrame:
+    """Merge metrics from models evaluated on the same held-out split."""
+    rf = rf_bundle["metrics"].set_index("Đại lượng")
+    ann = ann_bundle["metrics"].set_index("Đại lượng")
+    rows = []
+    for target in AI_TARGETS:
+        rf_row = rf.loc[target]
+        ann_row = ann.loc[target]
+        rows.append({
+            "Đầu ra": target,
+            "RF · MAE": float(rf_row["MAE"]),
+            "ANN · MAE": float(ann_row["MAE"]),
+            "RF · RMSE": float(rf_row["RMSE"]),
+            "ANN · RMSE": float(ann_row["RMSE"]),
+            "RF · R²": float(rf_row["R²"]),
+            "ANN · R²": float(ann_row["R²"]),
+            "MAE tốt hơn": "Random Forest" if float(rf_row["MAE"]) <= float(ann_row["MAE"]) else "ANN",
+            "RMSE tốt hơn": "Random Forest" if float(rf_row["RMSE"]) <= float(ann_row["RMSE"]) else "ANN",
+            "R² tốt hơn": "Random Forest" if float(rf_row["R²"]) >= float(ann_row["R²"]) else "ANN",
+        })
+    return pd.DataFrame(rows)
+
+
+def build_prediction_comparison(
+    base: dict[str, Any], values: dict[str, float], rf_bundle: dict[str, Any], ann_bundle: dict[str, Any]
+) -> pd.DataFrame:
+    """Predict with both saved models and compare against the analytical calculation."""
+    rf_prediction = predict_one(rf_bundle, values)
+    ann_prediction = predict_one(ann_bundle, values)
+    source_rows = [
+        ("Rr (Ω)", "Rr_ohm", float(base["Rr_ohm"])),
+        ("Re(Zin) (Ω)", "Zin_real_ohm", float(base["Zin_real_ohm"])),
+        ("Im(Zin) (Ω)", "Zin_imag_ohm", float(base["Zin_imag_ohm"])),
+        ("Gain (dBi)", "gain_dBi_approx", float(base["gain_dBi_approx"])),
+    ]
+    result = []
+    for label, target, analytical in source_rows:
+        rf_value = float(rf_prediction[target])
+        ann_value = float(ann_prediction[target])
+        scale = max(abs(analytical), 1e-12)
+        result.append({
+            "Đại lượng": label,
+            "Mô hình giải tích": analytical,
+            "Random Forest": rf_value,
+            "Sai số RF (%)": abs(rf_value - analytical) / scale * 100.0,
+            "ANN": ann_value,
+            "Sai số ANN (%)": abs(ann_value - analytical) / scale * 100.0,
+        })
+    return pd.DataFrame(result)
 
 st.set_page_config(
     page_title="LoopLab | Mô phỏng anten khung tròn nhỏ",
@@ -72,6 +231,17 @@ html, body, [class*="css"] { font-family: 'Be Vietnam Pro', sans-serif; }
 div[data-testid="stTabs"] button { font-weight:700; color:#50677D; }
 div[data-testid="stTabs"] button[aria-selected="true"] { color:#1769AA; }
 .stDownloadButton button, .stButton button { border-radius:10px; font-weight:700; }
+/* Ensure primary action labels remain legible on Streamlit's blue button. */
+div[data-testid="stButton"] button[kind="primary"],
+.stButton > button[kind="primary"],
+[data-testid="stBaseButton-primary"] {
+  color: #FFFFFF !important;
+}
+div[data-testid="stButton"] button[kind="primary"] *,
+.stButton > button[kind="primary"] * ,
+[data-testid="stBaseButton-primary"] * {
+  color: #FFFFFF !important;
+}
 hr { border-color:#E0E8EF; }
 footer { visibility:hidden; }
 </style>
@@ -122,11 +292,12 @@ def section(title: str, caption: str | None = None) -> None:
 def plot_layout(fig: go.Figure, height: int = 420) -> go.Figure:
     fig.update_layout(
         height=height,
-        margin=dict(l=12, r=12, t=48, b=12),
+        # Reserve extra top space so the title and horizontal legend do not overlap.
+        margin=dict(l=12, r=12, t=68, b=12),
         paper_bgcolor="rgba(255,255,255,0)",
         plot_bgcolor="#FFFFFF",
         font=dict(family="Be Vietnam Pro, sans-serif", color="#34495E", size=12),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0),
         hoverlabel=dict(bgcolor="#17324D", font_color="white"),
     )
     fig.update_xaxes(showgrid=True, gridcolor="#E8EEF3", zerolinecolor="#D8E2EA")
@@ -520,113 +691,294 @@ with tab_material:
     )
 
 with tab_ai:
-    section("Mô hình AI dự đoán đặc tính anten", "Sinh dữ liệu từ mô hình giải tích, huấn luyện Random Forest hoặc ANN, sau đó dự đoán và đánh giá trên tập kiểm tra.")
+    section(
+        "Mô hình AI dự đoán đặc tính anten",
+        "Huấn luyện đồng thời Random Forest và ANN trên cùng một dataset, so sánh công bằng, lưu mô hình độc lập và kiểm soát miền dự đoán."
+    )
     st.markdown(
-        "<div class='note-box'><b>Quy trình:</b> Sinh dữ liệu hình học–tần số–vật liệu → chia train/test 80/20 → huấn luyện mô hình → "
-        "đánh giá MAE, RMSE, R² → dự đoán bộ tham số hiện tại. Ba đầu ra dương (Rr, Re(Zin), Im(Zin)) được huấn luyện ở thang log để giảm chênh lệch độ lớn.</div>",
+        "<div class='note-box'><b>Quy trình:</b> Sinh một dataset duy nhất → dùng cùng chỉ số train/test 80/20 cho cả hai thuật toán → huấn luyện RF và ANN → so sánh MAE, RMSE, R² → lưu hai mô hình → dự đoán điểm làm việc hiện tại.</div>",
         unsafe_allow_html=True,
     )
-    ai_left, ai_right = st.columns([1.0, 1.0])
+
+    # Try to load previously saved artifacts from ./models on the first run.
+    load_messages = load_saved_bundles_once()
+    for message in load_messages:
+        if message.startswith("Đã nạp"):
+            st.success(message)
+        else:
+            st.warning(message)
+
+    ai_left, ai_right = st.columns([1.05, 1.0])
     with ai_left:
-        model_name = st.selectbox("Thuật toán", ["Random Forest", "ANN"], index=0)
-        sample_count = st.slider("Số mẫu dữ liệu tổng hợp", min_value=500, max_value=6000, value=2500, step=500)
-        seed = st.number_input("Random seed", min_value=0, max_value=99999, value=42, step=1)
-        train_clicked = st.button("⚙ Sinh dữ liệu & huấn luyện AI", type="primary", width="stretch")
+        st.markdown("**Thiết lập huấn luyện**")
+        sample_count = st.slider(
+            "Số mẫu dữ liệu tổng hợp", min_value=500, max_value=6000,
+            value=2500, step=500, key="ai_sample_count_v2"
+        )
+        seed = st.number_input(
+            "Random seed", min_value=0, max_value=99999, value=42,
+            step=1, key="ai_seed_v2"
+        )
+        train_both_clicked = st.button(
+            "⚙ Huấn luyện đồng thời RF + ANN", type="primary", width="stretch",
+            key="train_both_ai_v2"
+        )
     with ai_right:
         st.markdown("**Đầu vào mô hình**")
-        st.write("Bán kính R · Tần số f · Bán kính dây a · Số vòng N · Điện trở suất vật liệu ρ")
+        st.write("R · f · a · N · điện trở suất vật liệu ρ")
         st.markdown("**Đầu ra dự đoán**")
-        st.write("Điện trở bức xạ Rr · Re(Zin) · Im(Zin) · Gain (dBi)")
-        st.markdown("**Chỉ số đánh giá**")
-        st.write("MAE · RMSE · R² trên tập test độc lập")
+        st.write("Rr · Re(Zin) · Im(Zin) · Gain")
+        st.markdown("**Đánh giá**")
+        st.write("MAE · RMSE · R² trên cùng tập test độc lập")
+        st.caption("Cả hai mô hình nhận cùng dataset và cùng phép chia train/test có seed giống nhau.")
 
-    if train_clicked:
+    if train_both_clicked:
         try:
-            with st.spinner("Đang sinh dữ liệu và huấn luyện mô hình. Lần đầu có thể mất một chút thời gian..."):
-                dataset = generate_synthetic_dataset(int(sample_count), int(seed))
-                bundle = train_models(dataset, model_name=model_name, random_state=int(seed))
-            st.session_state["looplab_ai_dataset"] = dataset
-            st.session_state["looplab_ai_bundle"] = bundle
-            st.session_state["looplab_ai_model_name"] = model_name
-            st.success(f"Đã huấn luyện {model_name}: {bundle['n_train']:,} mẫu train · {bundle['n_test']:,} mẫu test.")
+            with st.spinner("Đang sinh dataset và huấn luyện cả Random Forest lẫn ANN..."):
+                generated_dataset = generate_synthetic_dataset(int(sample_count), int(seed))
+                rf_bundle = train_models(generated_dataset, model_name="Random Forest", random_state=int(seed))
+                ann_bundle = train_models(generated_dataset, model_name="ANN", random_state=int(seed))
+
+                # Attach provenance so the exported artifacts are self-describing.
+                training_metadata = {
+                    "dataset_rows": int(len(generated_dataset)),
+                    "n_train": int(rf_bundle["n_train"]),
+                    "n_test": int(rf_bundle["n_test"]),
+                    "random_state": int(seed),
+                    "train_test_ratio": "80/20",
+                    "input_domain": AI_INPUT_DOMAIN.copy(),
+                    "materials": list(MATERIALS.keys()),
+                    "target_definition": "Synthetic labels generated by antenna_core.calculate_antenna",
+                }
+                rf_bundle["training_metadata"] = training_metadata
+                ann_bundle["training_metadata"] = training_metadata
+
+            st.session_state[SESSION_BUNDLE_KEYS["Random Forest"]] = rf_bundle
+            st.session_state[SESSION_BUNDLE_KEYS["ANN"]] = ann_bundle
+            st.session_state["looplab_ai_dataset_v2"] = generated_dataset
+            rf_saved = save_bundle_locally(rf_bundle, "Random Forest")
+            ann_saved = save_bundle_locally(ann_bundle, "ANN")
+            st.success(
+                f"Đã huấn luyện xong hai mô hình trên cùng {len(generated_dataset):,} mẫu: "
+                f"{rf_bundle['n_train']:,} train và {rf_bundle['n_test']:,} test."
+            )
+            if rf_saved and ann_saved:
+                st.success(f"Đã lưu mô hình vào {rf_saved} và {ann_saved}.")
+            else:
+                st.warning("Không ghi được một hoặc cả hai file vào thư mục models/. Bạn vẫn có thể tải file .joblib ở bên dưới.")
         except Exception as exc:
-            st.error(f"Không thể huấn luyện mô hình: {exc}")
+            st.error(f"Không thể huấn luyện hai mô hình: {exc}")
 
-    bundle = st.session_state.get("looplab_ai_bundle")
-    dataset = st.session_state.get("looplab_ai_dataset")
-    active_model_name = st.session_state.get("looplab_ai_model_name")
-    if bundle is not None and dataset is not None:
-        if active_model_name != model_name:
-            st.warning(f"Mô hình đã huấn luyện là {active_model_name}. Nhấn nút huấn luyện để chuyển sang {model_name}.")
+    # Optional import path for model artifacts generated on another computer.
+    with st.expander("Nạp mô hình đã huấn luyện từ file .joblib", expanded=False):
+        st.warning(
+            "Chỉ nạp file .joblib do chính bạn tạo hoặc từ nguồn đáng tin cậy. "
+            "Định dạng joblib/pickle có thể thực thi mã khi nạp file không đáng tin cậy."
+        )
+        upload_rf = st.file_uploader("Mô hình Random Forest", type=["joblib", "pkl"], key="upload_rf_bundle_v2")
+        upload_ann = st.file_uploader("Mô hình ANN", type=["joblib", "pkl"], key="upload_ann_bundle_v2")
+        if st.button("Nạp các mô hình đã chọn", key="load_uploaded_bundles_v2"):
+            loaded_any = False
+            try:
+                if upload_rf is not None:
+                    st.session_state[SESSION_BUNDLE_KEYS["Random Forest"]] = load_bundle_bytes(
+                        upload_rf.getvalue(), "Random Forest"
+                    )
+                    loaded_any = True
+                if upload_ann is not None:
+                    st.session_state[SESSION_BUNDLE_KEYS["ANN"]] = load_bundle_bytes(
+                        upload_ann.getvalue(), "ANN"
+                    )
+                    loaded_any = True
+                if loaded_any:
+                    st.success("Đã nạp mô hình vào phiên làm việc hiện tại.")
+                else:
+                    st.info("Bạn chưa chọn file mô hình nào.")
+            except Exception as exc:
+                st.error(f"Không thể nạp mô hình: {exc}")
+
+    rf_bundle = st.session_state.get(SESSION_BUNDLE_KEYS["Random Forest"])
+    ann_bundle = st.session_state.get(SESSION_BUNDLE_KEYS["ANN"])
+    dataset = st.session_state.get("looplab_ai_dataset_v2")
+
+    if rf_bundle is None or ann_bundle is None:
+        st.info(
+            "Chưa có đủ cả hai mô hình. Nhấn **Huấn luyện đồng thời RF + ANN** hoặc nạp hai file .joblib đã được tạo trước đó."
+        )
+    else:
+        # Re-check expected structure before displaying metrics or running inference.
+        try:
+            rf_bundle = validate_model_bundle(rf_bundle, "Random Forest")
+            ann_bundle = validate_model_bundle(ann_bundle, "ANN")
+        except Exception as exc:
+            st.error(f"Mô hình đang lưu trong phiên không tương thích: {exc}")
+            st.stop()
+
+        st.markdown("---")
+        section("So sánh trực tiếp Random Forest và ANN")
+        comparison_df = build_model_comparison(rf_bundle, ann_bundle)
+        metrics_view = comparison_df[[
+            "Đầu ra", "RF · MAE", "ANN · MAE", "MAE tốt hơn",
+            "RF · RMSE", "ANN · RMSE", "RMSE tốt hơn",
+            "RF · R²", "ANN · R²", "R² tốt hơn",
+        ]]
+        st.dataframe(
+            metrics_view,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "RF · MAE": st.column_config.NumberColumn(format="%.6g"),
+                "ANN · MAE": st.column_config.NumberColumn(format="%.6g"),
+                "RF · RMSE": st.column_config.NumberColumn(format="%.6g"),
+                "ANN · RMSE": st.column_config.NumberColumn(format="%.6g"),
+                "RF · R²": st.column_config.NumberColumn(format="%.5f"),
+                "ANN · R²": st.column_config.NumberColumn(format="%.5f"),
+            },
+        )
+        st.caption(
+            "MAE và RMSE càng thấp càng tốt; R² càng gần 1 càng tốt. "
+            "Kết quả được tính trên cùng tập test vì cả hai lần gọi train_models dùng chung dataset và random_state."
+        )
+
+        chart_mae, chart_rmse, chart_r2 = st.columns(3)
+        with chart_mae:
+            fig_mae = go.Figure()
+            fig_mae.add_bar(name="Random Forest", x=comparison_df["Đầu ra"], y=comparison_df["RF · MAE"])
+            fig_mae.add_bar(name="ANN", x=comparison_df["Đầu ra"], y=comparison_df["ANN · MAE"])
+            fig_mae.update_layout(title="So sánh MAE (thang log)", barmode="group", yaxis_type="log", height=330)
+            fig_mae.update_xaxes(tickangle=-35, automargin=True)
+            st.plotly_chart(plot_layout(fig_mae, 330), width="stretch", key="ai_compare_mae_v2")
+        with chart_rmse:
+            fig_rmse = go.Figure()
+            fig_rmse.add_bar(name="Random Forest", x=comparison_df["Đầu ra"], y=comparison_df["RF · RMSE"])
+            fig_rmse.add_bar(name="ANN", x=comparison_df["Đầu ra"], y=comparison_df["ANN · RMSE"])
+            fig_rmse.update_layout(title="So sánh RMSE (thang log)", barmode="group", yaxis_type="log", height=330)
+            fig_rmse.update_xaxes(tickangle=-35, automargin=True)
+            st.plotly_chart(plot_layout(fig_rmse, 330), width="stretch", key="ai_compare_rmse_v2")
+        with chart_r2:
+            fig_r2 = go.Figure()
+            fig_r2.add_bar(name="Random Forest", x=comparison_df["Đầu ra"], y=comparison_df["RF · R²"])
+            fig_r2.add_bar(name="ANN", x=comparison_df["Đầu ra"], y=comparison_df["ANN · R²"])
+            fig_r2.update_layout(title="So sánh R²", barmode="group", height=330)
+            # Rotate category labels to avoid collisions in the narrow third column.
+            fig_r2.update_xaxes(tickangle=-35, automargin=True)
+            st.plotly_chart(plot_layout(fig_r2, 330), width="stretch", key="ai_compare_r2_v2")
+
+        metric_csv = comparison_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "↓ Tải bảng so sánh RF–ANN (CSV)", metric_csv,
+            "looplab_rf_ann_comparison.csv", "text/csv", key="download_rf_ann_metrics_v2"
+        )
+
+        # Save/export both full estimator bundles. The downloaded files can be
+        # committed under models/ in GitHub so deployed visitors can load them.
+        st.markdown("#### Lưu và xuất mô hình AI độc lập")
+        save_col1, save_col2 = st.columns(2)
+        with save_col1:
+            rf_bytes = serialize_bundle(rf_bundle)
+            st.download_button(
+                "↓ Tải mô hình Random Forest (.joblib)", rf_bytes,
+                "looplab_random_forest.joblib", "application/octet-stream",
+                key="download_rf_model_v2", width="stretch"
+            )
+        with save_col2:
+            ann_bytes = serialize_bundle(ann_bundle)
+            st.download_button(
+                "↓ Tải mô hình ANN (.joblib)", ann_bytes,
+                "looplab_ann.joblib", "application/octet-stream",
+                key="download_ann_model_v2", width="stretch"
+            )
+        st.markdown(
+            "<div class='note-box'><b>Cách lưu bền vững khi deploy:</b> tải hai file .joblib ở trên, đặt chúng trong thư mục "
+            "<code>models/</code> cùng cấp với <code>app.py</code>, rồi đưa thư mục đó lên GitHub. "
+            "Ứng dụng sẽ tự nạp hai mô hình từ <code>models/</code> khi khởi động. File ghi trực tiếp trên Streamlit Cloud "
+            "có thể mất khi máy chủ được tạo lại, vì vậy không nên dựa riêng vào lưu trữ runtime.</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Current-input domain guard. Analytical simulation remains available
+        # everywhere its own equations allow, but AI inference is blocked outside
+        # the distribution/ranges used to build the synthetic training set.
+        section("Kiểm soát miền dự đoán AI")
+        domain_problems = ai_domain_violations(
+            float(radius_cm), float(freq_mhz), float(wire_radius_mm), int(n_turns), material
+        )
+        domain_cols = st.columns(4)
+        domain_descriptions = [
+            ("R (cm)", "0.8 – 8.0"),
+            ("f (MHz)", "5 – 50"),
+            ("a (mm)", "0.25 – 1.5"),
+            ("N", "1 – 4 vòng"),
+        ]
+        for col, (label, bounds) in zip(domain_cols, domain_descriptions):
+            with col:
+                st.metric(label, bounds)
+        st.caption("Vật liệu hợp lệ: Đồng (Cu), Bạc (Ag), Vàng (Au), Nhôm (Al). Điều kiện vật lý bổ sung: C/λ < 0.1.")
+
+        if domain_problems:
+            st.error("Không thực hiện dự đoán AI vì thông số hiện tại nằm ngoài miền huấn luyện:")
+            for problem in domain_problems:
+                st.write(f"• {problem}")
+            st.info(
+                "Mô phỏng giải tích và các đồ thị vẫn hoạt động theo mô hình của chúng. "
+                "Để dùng AI, hãy đưa thông số về miền huấn luyện nêu trên. Không nên ngoại suy từ mô hình hiện tại."
+            )
         else:
-            st.markdown("---")
-            section("Kết quả đánh giá trên tập kiểm tra")
-            metrics_df = bundle["metrics"].copy()
-            metrics_display = metrics_df.rename(columns={"Đại lượng": "Đầu ra"})
-            st.dataframe(metrics_display, hide_index=True, width="stretch", column_config={
-                "MAE": st.column_config.NumberColumn(format="%.6g"),
-                "RMSE": st.column_config.NumberColumn(format="%.6g"),
-                "R²": st.column_config.NumberColumn(format="%.5f"),
-            })
-            st.caption("MAE và RMSE có đơn vị tương ứng với từng đại lượng; R² càng gần 1 thường thể hiện khả năng khớp tốt hơn trên tập test.")
-
             current_ai_input = {
-                "radius_cm": radius_cm,
-                "freq_mhz": freq_mhz,
-                "wire_radius_mm": wire_radius_mm,
-                "n_turns": n_turns,
+                "radius_cm": float(radius_cm),
+                "freq_mhz": float(freq_mhz),
+                "wire_radius_mm": float(wire_radius_mm),
+                "n_turns": int(n_turns),
                 "rho_ohm_m": float(MATERIALS[material]["rho_ohm_m"]),
             }
-            ai_prediction = predict_one(bundle, current_ai_input)
-            pred_df = pd.DataFrame([
-                {"Đại lượng": "Rr (Ω)", "Mô hình giải tích": base["Rr_ohm"], "AI dự đoán": ai_prediction["Rr_ohm"]},
-                {"Đại lượng": "Re(Zin) (Ω)", "Mô hình giải tích": base["Zin_real_ohm"], "AI dự đoán": ai_prediction["Zin_real_ohm"]},
-                {"Đại lượng": "Im(Zin) (Ω)", "Mô hình giải tích": base["Zin_imag_ohm"], "AI dự đoán": ai_prediction["Zin_imag_ohm"]},
-                {"Đại lượng": "Gain (dBi)", "Mô hình giải tích": base["gain_dBi_approx"], "AI dự đoán": ai_prediction["gain_dBi_approx"]},
-            ])
-            section("Dự đoán cho bộ thông số đang chọn")
-            st.dataframe(pred_df, hide_index=True, width="stretch", column_config={
-                "Mô hình giải tích": st.column_config.NumberColumn(format="%.7g"),
-                "AI dự đoán": st.column_config.NumberColumn(format="%.7g"),
-            })
-            err_rows = []
-            for row in pred_df.to_dict("records"):
-                analytic = float(row["Mô hình giải tích"])
-                prediction = float(row["AI dự đoán"])
-                abs_err = abs(prediction - analytic)
-                rel_err = abs_err / max(abs(analytic), 1e-12) * 100
-                err_rows.append({"Đại lượng": row["Đại lượng"], "Sai số tuyệt đối": abs_err, "Sai số tương đối (%)": rel_err})
-            st.dataframe(pd.DataFrame(err_rows), hide_index=True, width="stretch")
+            prediction_df = build_prediction_comparison(base, current_ai_input, rf_bundle, ann_bundle)
+            section("Dự đoán của hai mô hình tại điểm làm việc hiện tại")
+            st.dataframe(
+                prediction_df,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Mô hình giải tích": st.column_config.NumberColumn(format="%.7g"),
+                    "Random Forest": st.column_config.NumberColumn(format="%.7g"),
+                    "Sai số RF (%)": st.column_config.NumberColumn(format="%.4f"),
+                    "ANN": st.column_config.NumberColumn(format="%.7g"),
+                    "Sai số ANN (%)": st.column_config.NumberColumn(format="%.4f"),
+                },
+            )
+            st.download_button(
+                "↓ Tải bảng dự đoán RF–ANN tại điểm hiện tại (CSV)",
+                prediction_df.to_csv(index=False).encode("utf-8-sig"),
+                "looplab_rf_ann_current_prediction.csv", "text/csv",
+                key="download_rf_ann_prediction_v2",
+            )
 
-            preview_col, download_col = st.columns([1.2, 1])
-            with preview_col:
-                section("Xem trước dữ liệu tổng hợp")
+        if dataset is not None:
+            st.markdown("#### Dataset đã dùng để huấn luyện")
+            st.caption(
+                f"Dataset gồm {len(dataset):,} mẫu và {len(dataset.columns)} cột. "
+                "Miền sinh: R=0.8–8 cm, f=5–50 MHz, a=0.25–1.5 mm, N=1–4."
+            )
+            with st.expander("Xem trước 12 dòng dữ liệu"):
                 st.dataframe(dataset.head(12), hide_index=True, width="stretch")
-                st.caption(f"Dataset gồm {len(dataset):,} dòng và {len(dataset.columns)} cột. Phạm vi sinh: R=0.8–8 cm, f=5–50 MHz, dây 0.25–1.5 mm, N=1–4.")
-            with download_col:
-                section("Tải dữ liệu và kết quả AI")
-                st.download_button(
-                    "↓ Tải dataset huấn luyện (CSV)",
-                    dataset.to_csv(index=False).encode("utf-8-sig"),
-                    "anten_loop_ai_dataset.csv", "text/csv", width="stretch",
+            st.download_button(
+                "↓ Tải dataset huấn luyện (CSV)",
+                dataset.to_csv(index=False).encode("utf-8-sig"),
+                "anten_loop_ai_dataset.csv", "text/csv", key="download_ai_dataset_v2",
+            )
+        else:
+            meta = rf_bundle.get("training_metadata", {})
+            if meta:
+                st.caption(
+                    f"Mô hình đã nạp từ file độc lập · dataset {meta.get('dataset_rows', 'không rõ')} mẫu · "
+                    f"seed {meta.get('random_state', 'không rõ')} · train/test 80/20. "
+                    "Dataset gốc chưa được nạp vào phiên hiện tại."
                 )
-                st.download_button(
-                    "↓ Tải bảng MAE–RMSE–R² (CSV)",
-                    bundle["metrics"].to_csv(index=False).encode("utf-8-sig"),
-                    "anten_loop_ai_metrics.csv", "text/csv", width="stretch",
-                )
-                st.download_button(
-                    "↓ Tải dự đoán điểm hiện tại (CSV)",
-                    pred_df.to_csv(index=False).encode("utf-8-sig"),
-                    "anten_loop_ai_prediction.csv", "text/csv", width="stretch",
-                )
-    else:
-        st.info("Chưa có mô hình AI trong phiên làm việc này. Chọn thuật toán và nhấn **Sinh dữ liệu & huấn luyện AI** để bắt đầu.")
 
     st.markdown(
-        "<div class='warning-box'><b>Giới hạn quan trọng khi báo cáo:</b> Dataset hiện tại là dữ liệu tổng hợp do chính mô hình giải tích tạo ra. "
-        "Vì vậy MAE/RMSE/R² phản ánh mức độ AI học lại công thức xấp xỉ, chưa chứng minh độ chính xác so với anten thật. "
-        "Muốn đánh giá thực nghiệm, cần bổ sung dữ liệu đo VNA/anten chamber hoặc dữ liệu mô phỏng full-wave CST, HFSS, FEKO, openEMS.</div>",
+        "<div class='warning-box'><b>Giới hạn khoa học:</b> Dataset được sinh từ chính mô hình giải tích "
+        "<code>antenna_core.calculate_antenna</code>. Vì vậy MAE/RMSE/R² đánh giá mức độ AI học lại mô hình giải tích, "
+        "không chứng minh độ chính xác so với anten thực tế. Muốn kiểm chứng thực nghiệm cần dữ liệu VNA, buồng đo "
+        "hoặc mô phỏng điện từ toàn sóng CST/HFSS/FEKO/openEMS.</div>",
         unsafe_allow_html=True,
     )
 
